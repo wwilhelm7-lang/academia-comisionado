@@ -12,7 +12,7 @@
    el cache anterior y fuerza la descarga de la versión nueva.
    ===================================================================== */
 
-const CACHE_VERSION = 'aca-v2';
+const CACHE_VERSION = 'aca-v3';
 const CACHE_NAME = 'academia-' + CACHE_VERSION;
 
 const CORE_ASSETS = [

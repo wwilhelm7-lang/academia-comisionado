@@ -232,6 +232,17 @@ table.term-table tr:hover td{background:#182241;}
 @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.3;}}
 .transcript-box{background:#0a1122;border:1px solid var(--border);border-radius:8px;padding:14px;min-height:70px;font-size:13.4px;color:#d5deef;margin-bottom:12px;}
 .transcript-box.empty{color:#54638c;font-style:italic;}
+/* Transcripto sincronizado con la voz */
+.transcript-sync{max-height:300px;overflow-y:auto;line-height:1.85;margin-top:16px;}
+.ts-line{border-radius:4px;padding:1px 3px;transition:background .18s ease,color .18s ease;}
+.ts-line.on{background:rgba(91,140,255,.24);color:#fff;box-shadow:0 0 0 1px rgba(91,140,255,.4);}
+/* Diagrama dentro del reproductor de Escucha Diaria */
+.audio-visual{margin-top:16px;border:1px solid var(--border);border-radius:10px;overflow:hidden;background:#0a1122;}
+.audio-visual-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 13px;cursor:pointer;background:var(--panel-2);font-size:12.4px;color:var(--text);}
+.audio-visual-head:hover{background:#17203a;}
+.audio-visual-head .av-title{font-weight:600;}
+.audio-visual-head .av-toggle{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;white-space:nowrap;}
+.audio-visual .dg-note,.audio-visual .diagram-stage,.audio-visual .dg-legend,.audio-visual .dg-info{margin:12px 13px;}
 .compare-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:10px;}
 @media(max-width:820px){.compare-grid{grid-template-columns:1fr;}}
 .compare-col{background:#0e1a30;border-radius:8px;padding:14px;border:1px solid var(--border);}
@@ -6202,25 +6213,58 @@ function splitSegmentsByLanguage(text, baseLang){
   return merged.length ? merged : [{text, lang: baseLang}];
 }
 
-/* Arma la cola de reproducción: frases cortas, y dentro de cada frase los
-   tramos en inglés separados para que cambien de voz. La pausa (gap) va
-   solo al final de cada frase — es la respiración que faltaba. */
-function buildSpeechQueue(track){
-  const sentences = chunkForSpeech(normalizeForSpeech(track.text), SPEECH_MAX_CHARS);
+/* Las frases que se MUESTRAN en pantalla salen del texto original, para que
+   se lean normales. Lo que se PRONUNCIA sale de normalizar cada una de esas
+   mismas frases. Así cada frase en pantalla corresponde exactamente a lo que
+   se está oyendo, que es lo que permite resaltarla mientras suena.
+
+   El troceo del texto original es más corto que el límite real porque la
+   normalización alarga: "NPSHa" son 5 caracteres y se pronuncia como 27. */
+const DISPLAY_MAX_CHARS = 120;
+
+function buildSpeechPlan(track){
+  const sentences = chunkForSpeech(track.text, DISPLAY_MAX_CHARS);
   const queue = [];
-  sentences.forEach(function(sentence){
-    const segs = splitSegmentsByLanguage(sentence, track.lang);
-    segs.forEach(function(seg, i){
-      const last = (i === segs.length - 1);
-      queue.push({
-        text: seg.text,
-        lang: seg.lang,
-        /* Punto final = pausa larga. Coma o corte interno = pausa breve. */
-        gap: last ? (/[.!?]$/.test(sentence.trim()) ? 380 : 170) : 0
+  sentences.forEach(function(sentence, si){
+    const spoken = normalizeForSpeech(sentence);
+    /* Si aun normalizada se pasa del límite, se parte en varios utterances
+       que siguen apuntando a la MISMA frase en pantalla. */
+    const parts = spoken.length > SPEECH_MAX_CHARS
+      ? chunkForSpeech(spoken, SPEECH_MAX_CHARS)
+      : [spoken];
+    parts.forEach(function(part, pi){
+      const lastPart = (pi === parts.length - 1);
+      const segs = splitSegmentsByLanguage(part, track.lang);
+      segs.forEach(function(seg, i){
+        const lastSeg = (i === segs.length - 1);
+        queue.push({
+          text: seg.text,
+          lang: seg.lang,
+          sentence: si,
+          /* Punto final = pausa larga. Corte interno = pausa mínima. */
+          gap: (lastSeg && lastPart)
+            ? (/[.!?]$/.test(sentence.trim()) ? 380 : 170)
+            : (lastSeg ? 90 : 0)
+        });
       });
     });
   });
-  return queue;
+  return { sentences: sentences, queue: queue };
+}
+
+/* Resalta en el transcripto la frase que se está pronunciando y la mantiene
+   a la vista. Si el panel no está en pantalla, no hace nada. */
+function highlightAudioSentence(i){
+  const box = document.getElementById('audioTranscript');
+  if(!box) return;
+  const prev = box.querySelector('.ts-line.on');
+  if(prev) prev.classList.remove('on');
+  const el = box.querySelector('[data-ts="' + i + '"]');
+  if(!el) return;
+  el.classList.add('on');
+  /* Desplaza dentro de la caja, sin mover la página entera. */
+  const top = el.offsetTop - box.offsetTop - (box.clientHeight / 2) + (el.offsetHeight / 2);
+  box.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
 }
 
 let ttsGapTimer = null;
@@ -6230,7 +6274,8 @@ function speakAudioTrack(track, onEnd){
   window.speechSynthesis.cancel();
   if(ttsGapTimer){ clearTimeout(ttsGapTimer); ttsGapTimer = null; }
 
-  const queue = buildSpeechQueue(track);
+  const plan = buildSpeechPlan(track);
+  const queue = plan.queue;
   if(!queue.length){ if(onEnd) onEnd(); return; }
 
   const voiceEs = pickVoiceForLang('es');
@@ -6252,6 +6297,9 @@ function speakAudioTrack(track, onEnd){
     utter.rate = rate;
     utter.pitch = 1;
     utter.volume = 1;
+    /* Lo que sincroniza el texto con la voz: al empezar a sonar el tramo,
+       se resalta la frase a la que pertenece. */
+    utter.onstart = function(){ highlightAudioSentence(seg.sentence); };
 
     let fired = false;
     const advance = function(){
@@ -6439,7 +6487,8 @@ function renderAudioPlayerPanelHtml(){
         <span id="audioRateVal">${(audioProgress.rate||AUDIO_DEFAULT_RATE).toFixed(2)}x</span>
       </div>
 
-      <div class="transcript-box" style="margin-top:16px;">${escAttr(track.text)}</div>
+      ${renderAudioDiagramHtml(track)}
+      ${renderAudioTranscriptHtml(track)}
 
       <div class="audio-tracklist">${tracklistHtml}</div>
     </div>
@@ -6451,6 +6500,51 @@ function renderAudioPlayerPanel(){
   if(el) el.innerHTML = renderAudioPlayerPanelHtml();
   const listEl = document.getElementById('audioDayList');
   if(listEl) listEl.innerHTML = renderAudioDayListHtml();
+}
+
+/* Transcripto sincronizado: una frase por span, con el mismo troceo que usa
+   el motor de voz. Es lo que permite seguir la lectura con la vista — y
+   retomar el hilo cuando te distraes, que es el caso real de uso. */
+function renderAudioTranscriptHtml(track){
+  const sentences = chunkForSpeech(track.text, DISPLAY_MAX_CHARS);
+  if(!sentences.length) return '<div class="transcript-box empty">Esta pista no tiene texto.</div>';
+  const body = sentences.map(function(s, i){
+    return '<span class="ts-line" data-ts="' + i + '">' + escAttr(s) + '</span>';
+  }).join(' ');
+  return '<div class="transcript-box transcript-sync" id="audioTranscript">' + body + '</div>';
+}
+
+/* El diagrama del módulo al que pertenece la pista que está sonando: lo que
+   convierte la Escucha Diaria en algo que además se mira. Solo 8 de los
+   módulos tienen diagrama; en el resto no se muestra nada. */
+function renderAudioDiagramHtml(track){
+  const mod = MODULES[track.modIdx];
+  const d = mod ? DIAGRAMS[mod.id] : null;
+  if(!d) return '';
+  const open = audioProgress.showDiagram !== false;
+  const legend = (d.legend || []).map(function(l){
+    return '<span><i style="background:' + l.c + '"></i>' + l.t + '</span>';
+  }).join('');
+  return `
+    <div class="audio-visual">
+      <div class="audio-visual-head" onclick="toggleAudioDiagram()">
+        <span class="av-title">Diagrama · Módulo ${escAttr(mod.num)} — ${escAttr(d.title)}</span>
+        <span class="av-toggle">${open ? 'ocultar' : 'mostrar'}</span>
+      </div>
+      ${open ? `
+        <div class="dg-note">${d.note}</div>
+        <div class="diagram-stage">${d.svg}</div>
+        ${legend ? `<div class="dg-legend">${legend}</div>` : ''}
+        <div class="dg-info" id="dgInfoPanel">Toca cualquier elemento del diagrama para ver su explicación técnica.</div>
+      ` : ''}
+    </div>
+  `;
+}
+
+function toggleAudioDiagram(){
+  audioProgress.showDiagram = (audioProgress.showDiagram === false);
+  saveAudioProgress();
+  renderAudioPlayerPanel();
 }
 
 /* Selector de voz. Las voces del navegador se cargan de forma asíncrona:
