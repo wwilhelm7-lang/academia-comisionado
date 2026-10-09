@@ -301,6 +301,9 @@ ul.clean li{margin-bottom:5px;font-size:13.4px;color:#d5deef;}
 .audio-progress-inner{height:100%;background:linear-gradient(90deg,var(--purple),var(--blue));width:0%;transition:width .3s;}
 .audio-rate-row{display:flex;align-items:center;gap:10px;font-size:12.3px;color:var(--muted);}
 .audio-rate-row input[type="range"]{width:120px;}
+.audio-voice-row{display:flex;align-items:center;flex-wrap:wrap;gap:10px;font-size:12.3px;color:var(--muted);margin-bottom:9px;}
+.audio-voice-row select{flex:1;min-width:160px;max-width:340px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px 9px;font-size:12.2px;font-family:inherit;}
+.audio-voice-row .btn-mini{padding:6px 11px;font-size:11.5px;}
 .audio-tracklist{margin-top:20px;display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto;}
 .audio-track-row{display:flex;gap:10px;align-items:flex-start;padding:9px 11px;border-radius:8px;cursor:pointer;border:1px solid transparent;font-size:12.4px;color:var(--muted);}
 .audio-track-row:hover{background:var(--panel-2);}
@@ -4554,7 +4557,11 @@ function speak(text){
   if(!('speechSynthesis' in window)){ showToast('Tu navegador no soporta síntesis de voz.'); return; }
   window.speechSynthesis.cancel();
   const utter = new SpeechSynthesisUtterance(String(text).replace(/<[^>]*>/g,''));
-  utter.lang = 'en-US';
+  /* Misma selección de voz que la Escucha Diaria: sin esto el botón de
+     pronunciación usaba la primera voz inglesa de la lista, normalmente
+     una SAPI antigua de Windows. */
+  const voice = (typeof pickVoiceForLang === 'function') ? pickVoiceForLang('en') : null;
+  if(voice){ utter.voice = voice; utter.lang = voice.lang; } else utter.lang = 'en-US';
   utter.rate = 0.92;
   window.speechSynthesis.speak(utter);
 }
@@ -5813,6 +5820,10 @@ function copyCode(id){
    ===================================================================== */
 const AUDIO_WORDS_PER_DAY = 950; // ~ 7-8 minutos de escucha por día a ritmo normal
 
+/* Algo por debajo de 1 — la teoría técnica densa necesita más aire que una
+   lectura normal. El control de velocidad del reproductor parte de aquí. */
+const AUDIO_DEFAULT_RATE = 0.95;
+
 /* El progreso de audio ahora vive dentro del almacén unificado ACA.audio,
    por lo que se exporta e importa junto con el resto del progreso. */
 let audioProgress = ACA.audio;
@@ -5837,7 +5848,7 @@ function buildAudioLessons(){
     const theoryLessons = sections.map(sec=>{
       const h3 = sec.querySelector('h3');
       const title = h3 ? h3.textContent.replace(/^\d+\.\s*/,'').trim() : m.title;
-      return {modIdx:mi, modLabel:m.label, modNum:m.num, lang:'es', title, text: stripHtmlToText(sec.innerHTML)};
+      return {modIdx:mi, modLabel:m.label, modNum:m.num, lang:'es', title, text: htmlToSpeechText(sec.innerHTML)};
     });
     const qaLessons = (m.qa || []).map(item=>{
       return {modIdx:mi, modLabel:m.label, modNum:m.num, lang:'en', title:item.q, text: item.q + '. ' + stripHtmlToText(item.a)};
@@ -5876,11 +5887,271 @@ function getAudioDays(){
   return audioDaysCache;
 }
 
+/* =====================================================================
+   MOTOR DE VOZ
+   ---------------------------------------------------------------------
+   Reescrito para corregir los defectos reales de speechSynthesis que
+   hacían la Escucha Diaria robótica, entrecortada y atropellada:
+
+   1. VOZ ROBÓTICA — antes se tomaba la PRIMERA voz "es" de la lista del
+      navegador, que en Windows es una voz SAPI antigua (Helena, Sabina,
+      Pablo). Ahora las voces se puntúan y ganan las neuronales (las
+      "Online (Natural)" de Edge y las de Google), con preferencia
+      latinoamericana por sobre es-ES. Además se puede elegir a mano.
+
+   2. SE CORTA — Chrome trunca los utterances largos y suspende la
+      síntesis a los ~15 s. Ahora el texto se parte en frases de como
+      máximo 180 caracteres y un keep-alive mantiene viva la cola.
+
+   3. VA MUY RÁPIDO — no había respiración entre frases: todo salía
+      pegado. Ahora hay una pausa real entre frases, lo que baja la
+      sensación de velocidad sin tocar siquiera el control de rate.
+
+   4. NO SE ENTIENDE — siglas, unidades y fórmulas se leían crudas
+      ("P&ID", "4-20 mA", "Re = (ρ·v·D)/μ"). Ahora pasan por un
+      normalizador fonético antes de llegar a la voz.
+   ===================================================================== */
+
+/* --- 1. Selección de voz --------------------------------------------- */
+
+/* Puntúa una voz del navegador. Más alto = suena mejor. */
+function scoreVoice(v, prefix){
+  const lang = String(v.lang||'').toLowerCase().replace(/_/g,'-');
+  if(!lang.indexOf || lang.indexOf(prefix) !== 0) return -1;
+  const name = String(v.name||'').toLowerCase();
+  let s = 0;
+  if(/natural|neural/.test(name)) s += 100;  // Edge: "Microsoft Dalia Online (Natural)"
+  if(/online/.test(name))         s += 60;
+  if(/google/.test(name))         s += 45;   // Chrome de escritorio y Android
+  if(/multilingual/.test(name))   s += 20;
+  /* Las voces SAPI antiguas de Windows son exactamente las que sonaban a robot. */
+  if(/helena|sabina|pablo|laura|raul|elena|zira|david|mark|hortense/.test(name)) s -= 60;
+  if(v.localService) s -= 5;
+  if(prefix === 'es'){
+    if(/-(mx|us|cl|ar|co|pe|419)/.test(lang)) s += 25;  // español latino
+    if(lang.indexOf('es-es') === 0) s -= 10;            // España suena lejano acá
+  }
+  return s;
+}
+
+/* Lista de voces disponibles para un idioma, de mejor a peor. */
+function listVoicesForLang(prefix){
+  if(!('speechSynthesis' in window)) return [];
+  return window.speechSynthesis.getVoices()
+    .map(v => ({v:v, s:scoreVoice(v, prefix)}))
+    .filter(o => o.s >= 0)
+    .sort((a,b) => b.s - a.s)
+    .map(o => o.v);
+}
+
 function pickVoiceForLang(langCode){
-  if(!('speechSynthesis' in window)) return null;
-  const voices = window.speechSynthesis.getVoices();
-  const prefix = langCode.slice(0,2).toLowerCase();
-  return voices.find(v => v.lang && v.lang.toLowerCase().startsWith(prefix)) || null;
+  const prefix = String(langCode).slice(0,2).toLowerCase();
+  const list = listVoicesForLang(prefix);
+  if(!list.length) return null;
+  /* Si el usuario eligió una voz a mano para ese idioma, esa manda. */
+  const saved = prefix === 'es' ? audioProgress.voiceEs : audioProgress.voiceEn;
+  if(saved){
+    const chosen = list.filter(v => v.name === saved)[0];
+    if(chosen) return chosen;
+  }
+  return list[0];
+}
+
+/* --- 2. Normalización fonética --------------------------------------- */
+
+/* Siglas, unidades y símbolos que el TTS lee mal si se le entregan crudos.
+   Orden importante: lo más específico va primero. */
+const SAY_AS = [
+  [/\bASME\s*B\s*31\.3\b/gi, 'a ese eme e, be treinta y uno punto tres'],
+  [/\bASME\s*(VIII|8)\b/gi,  'a ese eme e sección ocho'],
+  [/\bISO\s*10816\b/gi,      'iso diez mil ochocientos dieciséis'],
+  [/\bISO\s*20816\b/gi,      'iso veinte mil ochocientos dieciséis'],
+  [/\bISA\s*5\.1\b/gi,       'isa cinco punto uno'],
+  [/\bAPI\s*682\b/gi,        'a pe i seiscientos ochenta y dos'],
+  [/\bAPI\b/g,               'a pe i'],
+  [/4\s*[-–a]\s*20\s*mA/gi,  'cuatro a veinte miliamperios'],
+  [/3\s*[-–a]\s*15\s*psi/gi, 'tres a quince pe ese i'],
+  [/\bP\s*&\s*IDs?\b/gi,     'pe ai di'],
+  [/\bPFDs?\b/g,             'pe efe de'],
+  [/\bNPSHa\b/g,             'ene pe ese hache disponible'],
+  [/\bNPSHr\b/g,             'ene pe ese hache requerido'],
+  [/\bNPSH\b/g,              'ene pe ese hache'],
+  [/\bRFSU\b/g,              'erre efe ese u'],
+  [/\bRFCs?\b/g,             'erre efe ce'],
+  [/\bITRs?\b/g,             'i te erre'],
+  [/\bPSVs?\b/g,             'pe ese ve'],
+  [/\bPRVs?\b/g,             'pe erre ve'],
+  [/\bESDVs?\b/g,            'e ese de ve'],
+  [/\bASVs?\b/g,             'a ese ve'],
+  [/\bDCS\b/g,               'de ce ese'],
+  [/\bPLCs?\b/g,             'pe ele ce'],
+  [/\bSIS\b/g,               'ese i ese'],
+  [/\bHAZOP\b/gi,            'jázop'],
+  [/\bLOTO\b/g,              'loto'],
+  [/\bPTW\b/g,               'permiso de trabajo'],
+  [/\bJSA\b/g,               'jota ese a'],
+  [/\bJHA\b/g,               'jota hache a'],
+  [/\bSIMOPS\b/gi,           'símops'],
+  [/\bMAWP\b/g,              'mau pe'],
+  [/\bCMS\b/g,               'ce eme ese'],
+  [/\bEPCs?\b/g,             'e pe ce'],
+  [/\bOEM\b/g,               'o e eme'],
+  [/\bBEP\b/g,               'be e pe'],
+  [/\bMCC\b/g,               'eme ce ce'],
+  [/\bTEMA\b/g,              'tema'],
+  [/\bI\/P\b/g,              'i pe'],
+  [/\bE\/S\b/g,              'entrada salida'],
+  [/\bI\/O\b/g,              'entrada salida'],
+  [/\bmm\/s\b/g,             'milímetros por segundo'],
+  [/\bm³\/h\b/g,             'metros cúbicos por hora'],
+  [/\bm3\/h\b/g,             'metros cúbicos por hora'],
+  [/\bmA\b/g,                'miliamperios'],
+  [/\bpsig?\b/gi,            'pe ese i'],
+  [/\bgpm\b/gi,              'galones por minuto'],
+  [/\brpm\b/gi,              'erre pe eme'],
+  [/\bkW\b/g,                'kilovatios'],
+  [/\bHP\b/g,                'hache pe'],
+  [/\bNm\b/g,                'newton metro'],
+  [/\blb-ft\b/gi,            'libra pie'],
+  [/°C\b/g,                  ' grados Celsius'],
+  [/°F\b/g,                  ' grados Fahrenheit'],
+  [/\bQ²/g,                  'caudal al cuadrado'],
+  [/\s*×\s*/g,               ' por '],
+  [/\s*≈\s*/g,               ' aproximadamente '],
+  [/\s*≥\s*/g,               ' mayor o igual que '],
+  [/\s*≤\s*/g,               ' menor o igual que '],
+  [/\s*·\s*/g,               ' '],
+  [/ρ/g, 'rho'], [/μ/g, 'mu'], [/Δ/g, 'delta'], [/Ω/g, 'ohm']
+];
+
+function normalizeForSpeech(text){
+  let t = ' ' + String(text) + ' ';
+  SAY_AS.forEach(function(rule){ t = t.replace(rule[0], rule[1]); });
+  return t
+    .replace(/\.{2,}/g, '.')      // puntos duplicados por el armado de bloques
+    .replace(/\s+([.,;:])/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/* Convierte el HTML de una sección de teoría en texto apto para leerse:
+   quita las fórmulas (ilegibles en voz alta), convierte las tablas en
+   frases y asegura un punto al final de cada bloque para que las frases
+   no se peguen entre sí. */
+function htmlToSpeechText(html){
+  const div = document.createElement('div');
+  div.innerHTML = html;
+
+  /* Una fórmula no se puede leer; su explicación (la caption) sí se queda. */
+  Array.prototype.forEach.call(div.querySelectorAll('.formula-box'), function(el){ el.remove(); });
+
+  /* "Field Check" y "Regla Innegociable" se anuncian en español y con pausa. */
+  const ALERT_ES = {
+    'field check':'Verificación de campo',
+    'regla innegociable':'Regla innegociable',
+    'regla de oro':'Regla de oro'
+  };
+  Array.prototype.forEach.call(div.querySelectorAll('.alert-tag'), function(el){
+    const k = el.textContent.trim().toLowerCase();
+    el.textContent = '. Atención. ' + (ALERT_ES[k] || el.textContent.trim()) + '. ';
+  });
+
+  /* Una tabla leída celda por celda es ruido. Se convierte en frases. */
+  Array.prototype.forEach.call(div.querySelectorAll('table'), function(tb){
+    const heads = Array.prototype.map.call(tb.querySelectorAll('thead th'), function(th){
+      return th.textContent.trim();
+    });
+    const rows = Array.prototype.map.call(tb.querySelectorAll('tbody tr'), function(tr){
+      return Array.prototype.map.call(tr.children, function(td, i){
+        const val = td.textContent.trim();
+        return (i > 0 && heads[i]) ? heads[i] + ': ' + val : val;
+      }).join('. ');
+    });
+    const p = document.createElement('p');
+    p.textContent = rows.join('. ') + '.';
+    tb.parentNode.replaceChild(p, tb);
+  });
+
+  /* Punto al cierre de cada bloque de texto: sin esto, el final de un
+     <li> se pega con el inicio del siguiente y la voz nunca respira. */
+  Array.prototype.forEach.call(div.querySelectorAll('li, p, h3, h4'), function(el){
+    const t = el.textContent.replace(/\s+$/,'');
+    if(t && !/[.!?:;]$/.test(t)) el.insertAdjacentText('beforeend', '.');
+  });
+
+  return normalizeForSpeech(div.textContent || '');
+}
+
+/* --- 3. Troceado en frases ------------------------------------------- */
+
+const SPEECH_MAX_CHARS = 180;  // por encima de esto Chrome trunca el utterance
+
+/* Corta por fin de frase sin usar lookbehind (rompe en Safari antiguo). */
+function splitSentences(text){
+  const out = [];
+  let buf = '';
+  for(let i = 0; i < text.length; i++){
+    const ch = text[i];
+    buf += ch;
+    if('.!?;'.indexOf(ch) !== -1){
+      const next = text[i+1];
+      /* Solo si viene espacio o se acaba el texto: así "1.5" y "B31.3"
+         no se parten por la mitad. */
+      if(next === undefined || next === ' '){
+        if(buf.trim()) out.push(buf.trim());
+        buf = '';
+      }
+    }
+  }
+  if(buf.trim()) out.push(buf.trim());
+  return out;
+}
+
+/* Parte lo que siga siendo demasiado largo: primero por comas, y si aun
+   así no cabe, por palabras. Nunca deja un trozo sobre el máximo. */
+function chunkForSpeech(text, maxLen){
+  const out = [];
+  function pushByWords(s){
+    let w = '';
+    s.split(/\s+/).forEach(function(word){
+      if(w && (w + ' ' + word).length > maxLen){ out.push(w); w = word; }
+      else w = w ? (w + ' ' + word) : word;
+    });
+    if(w) out.push(w);
+  }
+  splitSentences(text).forEach(function(s){
+    if(s.length <= maxLen){ out.push(s); return; }
+    let buf = '';
+    s.split(/,\s+/).forEach(function(part, idx, arr){
+      const piece = idx < arr.length - 1 ? part + ',' : part;
+      if(buf && (buf + ' ' + piece).length > maxLen){
+        if(buf.length > maxLen) pushByWords(buf); else out.push(buf);
+        buf = piece;
+      } else buf = buf ? (buf + ' ' + piece) : piece;
+    });
+    if(buf){ if(buf.length > maxLen) pushByWords(buf); else out.push(buf); }
+  });
+  return out.filter(function(s){ return s && /[a-zA-ZÁÉÍÓÚÜÑáéíóúüñ0-9]/.test(s); });
+}
+
+/* --- 4. Keep-alive ---------------------------------------------------- */
+
+/* Chrome de escritorio suspende la síntesis a los ~15 s y la pista se
+   corta sola. El pause/resume periódico la mantiene viva. En Android el
+   mismo truco reinicia el utterance, así que ahí no se aplica. */
+const TTS_IS_ANDROID = /Android/i.test(navigator.userAgent || '');
+let ttsKeepAliveTimer = null;
+
+function startTtsKeepAlive(){
+  stopTtsKeepAlive();
+  if(TTS_IS_ANDROID) return;
+  ttsKeepAliveTimer = setInterval(function(){
+    const s = window.speechSynthesis;
+    if(s && s.speaking && !s.paused){ s.pause(); s.resume(); }
+  }, 9000);
+}
+function stopTtsKeepAlive(){
+  if(ttsKeepAliveTimer){ clearInterval(ttsKeepAliveTimer); ttsKeepAliveTimer = null; }
 }
 
 /* ---- Mezcla de idioma dentro de una misma pista (términos EN embebidos en teoría ES) ----
@@ -5931,27 +6202,90 @@ function splitSegmentsByLanguage(text, baseLang){
   return merged.length ? merged : [{text, lang: baseLang}];
 }
 
+/* Arma la cola de reproducción: frases cortas, y dentro de cada frase los
+   tramos en inglés separados para que cambien de voz. La pausa (gap) va
+   solo al final de cada frase — es la respiración que faltaba. */
+function buildSpeechQueue(track){
+  const sentences = chunkForSpeech(normalizeForSpeech(track.text), SPEECH_MAX_CHARS);
+  const queue = [];
+  sentences.forEach(function(sentence){
+    const segs = splitSegmentsByLanguage(sentence, track.lang);
+    segs.forEach(function(seg, i){
+      const last = (i === segs.length - 1);
+      queue.push({
+        text: seg.text,
+        lang: seg.lang,
+        /* Punto final = pausa larga. Coma o corte interno = pausa breve. */
+        gap: last ? (/[.!?]$/.test(sentence.trim()) ? 380 : 170) : 0
+      });
+    });
+  });
+  return queue;
+}
+
+let ttsGapTimer = null;
+
 function speakAudioTrack(track, onEnd){
   if(!('speechSynthesis' in window)){ showToast('Tu navegador no soporta síntesis de voz.'); return; }
   window.speechSynthesis.cancel();
-  const segments = splitSegmentsByLanguage(track.text, track.lang);
+  if(ttsGapTimer){ clearTimeout(ttsGapTimer); ttsGapTimer = null; }
+
+  const queue = buildSpeechQueue(track);
+  if(!queue.length){ if(onEnd) onEnd(); return; }
+
+  const voiceEs = pickVoiceForLang('es');
+  const voiceEn = pickVoiceForLang('en');
+  const rate = audioProgress.rate || AUDIO_DEFAULT_RATE;
   let i = 0;
+
+  startTtsKeepAlive();
+
   function speakNext(){
-    if(i >= segments.length){ if(onEnd) onEnd(); return; }
-    const seg = segments[i++];
+    if(!audioState.playing){ stopTtsKeepAlive(); return; }
+    if(i >= queue.length){ stopTtsKeepAlive(); if(onEnd) onEnd(); return; }
+
+    const seg = queue[i++];
     const utter = new SpeechSynthesisUtterance(seg.text);
-    const langCode = seg.lang === 'es' ? 'es-ES' : 'en-US';
-    utter.lang = langCode;
-    const voice = pickVoiceForLang(langCode);
-    if(voice) utter.voice = voice;
-    utter.rate = audioProgress.rate || 1;
+    const voice = seg.lang === 'es' ? voiceEs : voiceEn;
+    if(voice){ utter.voice = voice; utter.lang = voice.lang; }
+    else { utter.lang = seg.lang === 'es' ? 'es-MX' : 'en-US'; }
+    utter.rate = rate;
+    utter.pitch = 1;
+    utter.volume = 1;
+
     let fired = false;
-    const fireOnce = ()=>{ if(fired) return; fired = true; speakNext(); };
-    utter.onend = fireOnce;
-    utter.onerror = fireOnce;
+    const advance = function(){
+      if(fired) return;
+      fired = true;
+      if(seg.gap > 0){ ttsGapTimer = setTimeout(speakNext, seg.gap); }
+      else speakNext();
+    };
+    utter.onend = advance;
+    utter.onerror = advance;
     window.speechSynthesis.speak(utter);
   }
   speakNext();
+}
+
+/* Vista previa de una voz, para el selector del reproductor. */
+function previewVoice(){
+  if(!('speechSynthesis' in window)) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(
+    'Antes de energizar, verifica que el certificado de terminación mecánica esté firmado.'
+  );
+  const v = pickVoiceForLang('es');
+  if(v){ u.voice = v; u.lang = v.lang; } else u.lang = 'es-MX';
+  u.rate = audioProgress.rate || AUDIO_DEFAULT_RATE;
+  window.speechSynthesis.speak(u);
+}
+
+function setAudioVoice(which, name){
+  if(which === 'en') audioProgress.voiceEn = name || '';
+  else audioProgress.voiceEs = name || '';
+  saveAudioProgress();
+  if(audioState.playing) playAudioFromCurrent();
+  else if(which !== 'en') previewVoice();
 }
 
 function getCurrentAudioDay(){
@@ -5991,11 +6325,15 @@ function toggleAudioPlayPause(){
 }
 function pauseAudioPlayback(){
   audioState.playing = false;
+  stopTtsKeepAlive();
+  if(ttsGapTimer){ clearTimeout(ttsGapTimer); ttsGapTimer = null; }
   if('speechSynthesis' in window) window.speechSynthesis.cancel();
   renderAudioPlayerPanel();
 }
 function stopAudioIfActive(){
   audioState.playing = false;
+  stopTtsKeepAlive();
+  if(ttsGapTimer){ clearTimeout(ttsGapTimer); ttsGapTimer = null; }
   if('speechSynthesis' in window) window.speechSynthesis.cancel();
 }
 function goToAudioTrack(i){
@@ -6093,10 +6431,12 @@ function renderAudioPlayerPanelHtml(){
         <button class="btn btn-secondary" onclick="nextAudioTrack()" ${audioState.trackIndex>=day.length-1?'disabled':''}>Siguiente ⏭</button>
       </div>
 
+      ${renderVoicePickerHtml()}
+
       <div class="audio-rate-row">
         <span>Velocidad:</span>
-        <input type="range" min="0.7" max="1.4" step="0.05" value="${audioProgress.rate||1}" oninput="setAudioRate(this.value)">
-        <span id="audioRateVal">${(audioProgress.rate||1).toFixed(2)}x</span>
+        <input type="range" min="0.6" max="1.4" step="0.05" value="${audioProgress.rate||AUDIO_DEFAULT_RATE}" oninput="setAudioRate(this.value)">
+        <span id="audioRateVal">${(audioProgress.rate||AUDIO_DEFAULT_RATE).toFixed(2)}x</span>
       </div>
 
       <div class="transcript-box" style="margin-top:16px;">${escAttr(track.text)}</div>
@@ -6111,6 +6451,33 @@ function renderAudioPlayerPanel(){
   if(el) el.innerHTML = renderAudioPlayerPanelHtml();
   const listEl = document.getElementById('audioDayList');
   if(listEl) listEl.innerHTML = renderAudioDayListHtml();
+}
+
+/* Selector de voz. Las voces del navegador se cargan de forma asíncrona:
+   si la lista todavía viene vacía, se avisa en vez de mostrar un hueco. */
+function renderVoicePickerHtml(){
+  if(!('speechSynthesis' in window)) return '';
+  const es = listVoicesForLang('es');
+  const en = listVoicesForLang('en');
+  if(!es.length && !en.length){
+    return `<div class="audio-voice-row"><span class="small-muted">Cargando las voces del navegador…</span></div>`;
+  }
+  const opts = (list, saved) => list.map(v => {
+    const best = /natural|neural|online|google/i.test(v.name) ? ' ★' : '';
+    return `<option value="${escAttr(v.name)}" ${v.name===saved?'selected':''}>${escAttr(v.name)}${best}</option>`;
+  }).join('');
+  return `
+    <div class="audio-voice-row">
+      <span>Voz español:</span>
+      <select onchange="setAudioVoice('es', this.value)">${opts(es, audioProgress.voiceEs)}</select>
+      <button class="btn btn-secondary btn-mini" onclick="previewVoice()">▶ Probar</button>
+    </div>
+    <div class="audio-voice-row">
+      <span>Voz inglés:</span>
+      <select onchange="setAudioVoice('en', this.value)">${opts(en, audioProgress.voiceEn)}</select>
+      <span class="small-muted">Las marcadas con ★ son neuronales: suenan mucho mejor.</span>
+    </div>
+  `;
 }
 
 function renderAudioView(){
@@ -6128,8 +6495,15 @@ function renderAudioView(){
 }
 
 function afterRenderAudio(){
-  if('speechSynthesis' in window && window.speechSynthesis.getVoices().length === 0){
-    window.speechSynthesis.onvoiceschanged = ()=>{};
+  if(!('speechSynthesis' in window)) return;
+  /* El navegador entrega la lista de voces de forma asíncrona. Si todavía
+     no llegó, el selector se repinta en cuanto esté: sin esto el usuario
+     ve "Cargando voces" para siempre y se queda con la voz por defecto. */
+  if(window.speechSynthesis.getVoices().length === 0){
+    window.speechSynthesis.onvoiceschanged = function(){
+      window.speechSynthesis.onvoiceschanged = null;
+      if(document.getElementById('audioPlayerPanel')) renderAudioPlayerPanel();
+    };
   }
 }
 
